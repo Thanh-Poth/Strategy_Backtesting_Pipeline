@@ -1,0 +1,88 @@
+# Portfolio Construction — allocation, risque, sizing
+
+Ce module ajoute la couche qui manquait à ton dashboard : passer de
+"un alpha par actif" à "un portefeuille" avec gestion du risque et
+sizing dynamique.
+
+## Structure
+
+```
+data.py       -> téléchargement des prix multi-actifs (yfinance)
+signals.py    -> alphas par actif (momentum + mean-reversion, à remplacer
+                 par la sortie de ton modèle ML existant)
+risk.py       -> VaR historique/paramétrique, CVaR, drawdown
+sizing.py     -> risk parity (itératif) + Kelly criterion multi-actifs
+                 + throttle de drawdown (de-risking progressif)
+portfolio.py  -> assemble sizing + contraintes VaR + throttle drawdown
+                 en poids de portefeuille à une date donnée
+backtest.py   -> boucle causale (pas de look-ahead) : rebalancement
+                 périodique, coûts de transaction, courbe d'équité
+main.py       -> script d'exécution complet avec graphiques
+```
+
+## Installation
+
+```bash
+pip install yfinance pandas numpy scipy matplotlib
+python main.py
+```
+
+## Les trois briques théoriques
+
+### 1. Risk parity
+Au lieu de pondérer par rendement espéré (souvent mal estimé), on pondère
+pour que **chaque actif contribue à parts égales au risque total** du
+portefeuille. Résolu ici par un algorithme itératif simple (pas besoin de
+solveur externe) : `sizing.risk_parity_weights(cov)`.
+
+### 2. Kelly criterion (multi-actifs)
+`f* = Σ⁻¹ μ` où Σ est la covariance et μ le vecteur de rendements espérés.
+Le Kelly plein est agressif et très sensible aux erreurs sur μ — on
+applique un **Kelly fractionnaire** (`kelly_fraction=0.5`, "half-Kelly")
+et un plafond de levier brut (`gross_leverage_cap`).
+
+### 3. Contraintes de risque dures
+- **VaR** : si la VaR paramétrique du portefeuille dépasse le budget fixé
+  (`var_budget`), on réduit tous les poids proportionnellement.
+- **Max drawdown** : `drawdown_throttle()` réduit l'exposition brute de
+  façon linéaire à mesure que le drawdown courant approche `dd_limit`
+  (jusqu'à un plancher `dd_min_exposure`). C'est un de-risking réactif,
+  complémentaire (pas substitut) à la VaR qui elle est prospective.
+
+## Intégration avec ton dashboard FastAPI/React existant
+
+- `backtest.run_walk_forward_backtest()` attend un callable
+  `alpha_predict_func(expanding_prices) -> Series` (un score par actif,
+  calculé uniquement à partir des prix connus à la date de rebalancement).
+  Pour un signal vectorisé type `combined_alpha` (qui calcule tout
+  l'historique d'un coup), utilise l'adaptateur fourni :
+  `signals.make_walk_forward_predictor(combined_alpha)`. Pour brancher ton
+  vrai modèle ML (endpoint qui renvoie déjà les alphas), écris directement
+  ta propre fonction avec cette signature — sans passer par l'adaptateur.
+- Expose `run_walk_forward_backtest()` derrière un nouvel endpoint FastAPI
+  (ex. `POST /portfolio/backtest`) qui prend `tickers`, `method`,
+  `var_budget`, `dd_limit` en paramètres JSON et renvoie `metrics` +
+  `equity_curve` + `weights_history` en JSON pour un nouvel onglet
+  React "Portfolio" (courbe d'équité, aires empilées des poids,
+  courbe de drawdown — mêmes libs que ton `Backtest.jsx` actuel).
+- `PortfolioConfig` est un modèle **Pydantic** (validation des bornes
+  incluse) : `cfg.model_dump()` / `cfg.model_dump_json()` pour le
+  sérialiser direct depuis un formulaire React.
+
+## Point d'attention : le backtest est causal
+
+Les poids décidés au jour `t` (avec la covariance et l'alpha connus à `t`)
+ne s'appliquent qu'au rendement du jour `t+1` (`backtest.py`, boucle
+principale). C'est ce qui évite le biais de look-ahead classique qui rend
+un backtest "trop beau" — à vérifier en priorité si tu modifies la boucle.
+
+## Limites connues / pistes d'amélioration
+
+- Les alphas de `signals.py` sont volontairement simples (démo) —
+  branche ton vrai modèle ML.
+- La covariance est estimée sur une fenêtre glissante simple ; pour aller
+  plus loin : shrinkage (Ledoit-Wolf), EWMA, ou modèle factoriel.
+- Kelly utilise l'alpha comme proxy de μ, ce qui est une approximation
+  grossière — dans l'idéal μ vient d'une calibration séparée
+  (ex. rendement espéré = alpha_score × volatilité historique de l'actif).
+- Pas de gestion multi-devises ni de coûts de financement du levier.
