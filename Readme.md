@@ -8,7 +8,7 @@
 
 ---
 
-## TL;DR for recruiters
+## Project Overview
 
 | | |
 |---|---|
@@ -81,7 +81,7 @@ Plug in your own model: write a function with the signature `alpha_predict_func(
 
 ---
 
-## Skills demonstrated
+## Skills
 
 **Quant finance**: risk parity, Kelly criterion, VaR / CVaR, drawdown control, walk-forward validation, look-ahead bias prevention
 **Python**: NumPy, pandas, SciPy, Matplotlib, Pydantic, modular package design, unit tests
