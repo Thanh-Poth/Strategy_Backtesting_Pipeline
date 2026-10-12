@@ -1,88 +1,99 @@
-# Portfolio Construction — allocation, risque, sizing
+# Strategy Backtesting & Portfolio Construction Pipeline
 
-Ce module ajoute la couche qui manquait à ton dashboard : passer de
-"un alpha par actif" à "un portefeuille" avec gestion du risque et
-sizing dynamique.
+> From "one signal per asset" to a **risk-managed multi-asset portfolio**: risk-parity allocation, fractional Kelly sizing, VaR budgeting, drawdown throttling, and a **causal (no look-ahead) walk-forward backtest** with transaction costs.
 
-## Structure
+![Python](https://img.shields.io/badge/Python-3.10+-blue) ![Domain](https://img.shields.io/badge/Domain-Quantitative%20Finance-darkgreen) ![Status](https://img.shields.io/badge/Tests-pytest-informational)
+
+![Backtest report](backtest_report.png)
+
+---
+
+## TL;DR for recruiters
+
+| | |
+|---|---|
+| **Problem** | A trading signal alone is not a strategy. Capital must be allocated across assets, risk must be bounded, and the backtest must not cheat by peeking at future data. |
+| **Solution** | A modular Python pipeline: data → signals → risk estimation → position sizing → portfolio constraints → walk-forward backtest. |
+| **Key engineering choice** | Weights decided at day *t* only earn the return of day *t+1*, which removes look-ahead bias, the most common reason backtests look "too good". |
+| **Skills shown** | Quantitative portfolio theory, risk management (VaR / CVaR / drawdown), numerical methods, clean modular design, input validation (Pydantic), unit testing. |
+
+---
+
+## Architecture
 
 ```
-data.py       -> téléchargement des prix multi-actifs (yfinance)
-signals.py    -> alphas par actif (momentum + mean-reversion, à remplacer
-                 par la sortie de ton modèle ML existant)
-risk.py       -> VaR historique/paramétrique, CVaR, drawdown
-sizing.py     -> risk parity (itératif) + Kelly criterion multi-actifs
-                 + throttle de drawdown (de-risking progressif)
-portfolio.py  -> assemble sizing + contraintes VaR + throttle drawdown
-                 en poids de portefeuille à une date donnée
-backtest.py   -> boucle causale (pas de look-ahead) : rebalancement
-                 périodique, coûts de transaction, courbe d'équité
-main.py       -> script d'exécution complet avec graphiques
+data.py        Multi-asset price download (yfinance)
+signals.py     Per-asset alphas (momentum + mean-reversion) + walk-forward adapter
+risk.py        Historical & parametric VaR, CVaR, drawdown
+sizing.py      Risk parity (iterative), multi-asset Kelly, drawdown throttle
+portfolio.py   Combines sizing + VaR budget + drawdown throttle into target weights
+backtest.py    Causal walk-forward loop: periodic rebalancing, transaction costs, equity curve
+main.py        End-to-end run with charts
+test_core.py   Unit tests on the core logic
 ```
 
-## Installation
+Data flow: `prices -> signals -> covariance & risk -> sizing -> constraints -> weights(t) -> return(t+1) -> equity curve`
+
+---
+
+## The three theoretical building blocks
+
+### 1. Risk parity
+Instead of weighting assets by expected return (which is notoriously hard to estimate), weights are chosen so that **every asset contributes an equal share of total portfolio risk**. Solved with a simple iterative algorithm, so no external optimizer is needed (`sizing.risk_parity_weights(cov)`).
+
+### 2. Kelly criterion (multi-asset, fractional)
+The growth-optimal allocation is `f* = Σ⁻¹ μ` (Σ: covariance matrix, μ: expected returns). Full Kelly is aggressive and extremely sensitive to errors in μ, so the pipeline uses **half-Kelly** (`kelly_fraction = 0.5`) together with a **gross leverage cap** (`gross_leverage_cap`).
+
+### 3. Hard risk constraints
+- **VaR budget**: if the portfolio's parametric VaR exceeds `var_budget`, all weights are scaled down proportionally (forward-looking control).
+- **Drawdown throttle**: gross exposure is reduced linearly as the current drawdown approaches `dd_limit`, down to a floor `dd_min_exposure` (reactive control that complements the VaR).
+
+---
+
+## Why the backtest is trustworthy
+
+- **Causal by construction**: weights computed with information available at day *t* are applied to the return of day *t+1* only (main loop of `backtest.py`).
+- **Walk-forward**: `run_walk_forward_backtest()` expects a callable `alpha_predict_func(expanding_prices) -> Series`, so the signal only ever sees data up to the rebalancing date.
+- **Transaction costs** are charged at each rebalance.
+- **Typed configuration**: `PortfolioConfig` is a Pydantic model, so parameter bounds are validated and the config serializes straight to JSON (ready for an API or a UI).
+
+Outputs: performance `metrics`, `equity_curve`, and `weights_history`.
+
+---
+
+## Quick start
 
 ```bash
-pip install yfinance pandas numpy scipy matplotlib
+pip install yfinance pandas numpy scipy matplotlib pydantic
 python main.py
 ```
 
-## Les trois briques théoriques
+Plug in your own model: write a function with the signature `alpha_predict_func(expanding_prices) -> pd.Series` (one score per asset) and pass it to `run_walk_forward_backtest()`. A vectorized signal can be wrapped with `signals.make_walk_forward_predictor(...)`.
 
-### 1. Risk parity
-Au lieu de pondérer par rendement espéré (souvent mal estimé), on pondère
-pour que **chaque actif contribue à parts égales au risque total** du
-portefeuille. Résolu ici par un algorithme itératif simple (pas besoin de
-solveur externe) : `sizing.risk_parity_weights(cov)`.
+---
 
-### 2. Kelly criterion (multi-actifs)
-`f* = Σ⁻¹ μ` où Σ est la covariance et μ le vecteur de rendements espérés.
-Le Kelly plein est agressif et très sensible aux erreurs sur μ — on
-applique un **Kelly fractionnaire** (`kelly_fraction=0.5`, "half-Kelly")
-et un plafond de levier brut (`gross_leverage_cap`).
+## Known limitations and next steps
 
-### 3. Contraintes de risque dures
-- **VaR** : si la VaR paramétrique du portefeuille dépasse le budget fixé
-  (`var_budget`), on réduit tous les poids proportionnellement.
-- **Max drawdown** : `drawdown_throttle()` réduit l'exposition brute de
-  façon linéaire à mesure que le drawdown courant approche `dd_limit`
-  (jusqu'à un plancher `dd_min_exposure`). C'est un de-risking réactif,
-  complémentaire (pas substitut) à la VaR qui elle est prospective.
+- The alphas in `signals.py` are deliberately simple (demo purpose); the design is meant to receive a real ML model.
+- Covariance uses a simple rolling window. Natural upgrades: Ledoit-Wolf shrinkage, EWMA, factor models.
+- Kelly uses the alpha score as a proxy for μ. A cleaner approach calibrates μ separately (e.g. score × historical volatility).
+- No multi-currency handling and no financing cost for leverage.
 
-## Intégration avec ton dashboard FastAPI/React existant
+---
 
-- `backtest.run_walk_forward_backtest()` attend un callable
-  `alpha_predict_func(expanding_prices) -> Series` (un score par actif,
-  calculé uniquement à partir des prix connus à la date de rebalancement).
-  Pour un signal vectorisé type `combined_alpha` (qui calcule tout
-  l'historique d'un coup), utilise l'adaptateur fourni :
-  `signals.make_walk_forward_predictor(combined_alpha)`. Pour brancher ton
-  vrai modèle ML (endpoint qui renvoie déjà les alphas), écris directement
-  ta propre fonction avec cette signature — sans passer par l'adaptateur.
-- Expose `run_walk_forward_backtest()` derrière un nouvel endpoint FastAPI
-  (ex. `POST /portfolio/backtest`) qui prend `tickers`, `method`,
-  `var_budget`, `dd_limit` en paramètres JSON et renvoie `metrics` +
-  `equity_curve` + `weights_history` en JSON pour un nouvel onglet
-  React "Portfolio" (courbe d'équité, aires empilées des poids,
-  courbe de drawdown — mêmes libs que ton `Backtest.jsx` actuel).
-- `PortfolioConfig` est un modèle **Pydantic** (validation des bornes
-  incluse) : `cfg.model_dump()` / `cfg.model_dump_json()` pour le
-  sérialiser direct depuis un formulaire React.
+## Skills demonstrated
 
-## Point d'attention : le backtest est causal
+**Quant finance**: risk parity, Kelly criterion, VaR / CVaR, drawdown control, walk-forward validation, look-ahead bias prevention
+**Python**: NumPy, pandas, SciPy, Matplotlib, Pydantic, modular package design, unit tests
+**Engineering mindset**: reproducible pipeline, explicit assumptions, documented limitations
 
-Les poids décidés au jour `t` (avec la covariance et l'alpha connus à `t`)
-ne s'appliquent qu'au rendement du jour `t+1` (`backtest.py`, boucle
-principale). C'est ce qui évite le biais de look-ahead classique qui rend
-un backtest "trop beau" — à vérifier en priorité si tu modifies la boucle.
+---
 
-## Limites connues / pistes d'amélioration
+## Related project
 
-- Les alphas de `signals.py` sont volontairement simples (démo) —
-  branche ton vrai modèle ML.
-- La covariance est estimée sur une fenêtre glissante simple ; pour aller
-  plus loin : shrinkage (Ledoit-Wolf), EWMA, ou modèle factoriel.
-- Kelly utilise l'alpha comme proxy de μ, ce qui est une approximation
-  grossière — dans l'idéal μ vient d'une calibration séparée
-  (ex. rendement espéré = alpha_score × volatilité historique de l'actif).
-- Pas de gestion multi-devises ni de coûts de financement du levier.
+Designed to plug into my FastAPI + React trading [Dashboard](https://github.com/Thanh-Poth/Dashboard) (the backtest function can sit behind a `POST /portfolio/backtest` endpoint).
+
+## Author
+
+**Thanh Son Potherat**: engineering student focused on quantitative finance, machine learning and data science.
+[GitHub](https://github.com/Thanh-Poth) | [LinkedIn](https://www.linkedin.com/in/thanh-son-potherat-b793b333a/)
